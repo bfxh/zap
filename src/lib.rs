@@ -5,6 +5,11 @@
 //!
 //! 同一套代码编译成 CLI（`zap`）、静态/动态库（手机 App 通过 FFI 调用）。
 //!
+//! 设计要点（v0.2）：
+//! - 每个线程只建一次模型存储，块与块之间 `reset` 复用，不再逐块 malloc/free；
+//! - 压缩结果按偏移直接写进输出文件，不再把整包压缩数据攒在内存里；
+//! - 解码认 ZAP2（索引带偏移）与旧版 ZAP1（流按块序隐式排列）。
+//!
 //! 用法：
 //!   zap c <in> <out> [threads]
 //!   zap d <in> <out> [threads]
@@ -23,9 +28,12 @@ use std::sync::Mutex;
 
 /// 流头长度：magic(4) + nblocks(4) + total(8) + order(1) + mem_mb(2)
 pub const HEADER_LEN: usize = 19;
-/// 每块目录项长度：blen u32 + clen u32
-pub const INDEX_ENTRY: usize = 8;
-pub const MAGIC: &[u8; 4] = b"ZAP1";
+/// ZAP2 每块目录项：blen u32 + clen u32 + off u64
+pub const INDEX_ENTRY: usize = 16;
+/// ZAP1 每块目录项（旧格式，流按块序隐式拼接）
+pub const INDEX_ENTRY_V1: usize = 8;
+pub const MAGIC: &[u8; 4] = b"ZAP2";
+pub const MAGIC_V1: &[u8; 4] = b"ZAP1";
 
 pub fn envu<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k)
@@ -54,19 +62,9 @@ fn params_for(order: u32, mem_mb: u32, len: usize) -> Params {
         .reduced_for(len as u64)
 }
 
-/// 单块压缩（panic 版，CLI 用）。库 / FFI 请用 `encode_block_try`。
-pub fn encode_block(data: &[u8], order: u32, mem_mb: u32) -> Vec<u8> {
-    encode_block_try(data, order, mem_mb).expect("encode")
-}
-
-/// 单块压缩，返回错误而不是 panic。
-///
-/// 输出缓冲区按需翻倍增长：PPMd 对不可压缩的数据会略微膨胀，而编码器在输出
-/// 缓冲填满时会返回 0 进度。老版本遇到这种情况直接 break，等于静默把尾巴截断
-/// —— 那是一份悄悄损坏的归档，所以这里改成"没进度就扩容，翻倍 8 次还不行才报错"。
-pub fn encode_block_try(data: &[u8], order: u32, mem_mb: u32) -> Result<Vec<u8>, String> {
-    let params = params_for(order, mem_mb, data.len());
-    let mut enc = SevenZEncoder::new(params).map_err(|e| format!("encoder: {e:?}"))?;
+/// 把 `enc` 里当前这个流跑完，返回压缩字节。
+/// 调用方负责在这之前 `new` / `reset`（模型存储由 encoder 自己复用）。
+fn drain_encoder(enc: &mut SevenZEncoder, data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; data.len() + data.len() / 4 + 65536];
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
@@ -101,7 +99,23 @@ pub fn encode_block_try(data: &[u8], order: u32, mem_mb: u32) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// 单块解压（panic 版，CLI 用）。
+/// 单块压缩（panic 版，一次性调用用）。
+pub fn encode_block(data: &[u8], order: u32, mem_mb: u32) -> Vec<u8> {
+    encode_block_try(data, order, mem_mb).expect("encode")
+}
+
+/// 单块压缩，返回错误而不是 panic。
+///
+/// 输出缓冲区按需翻倍增长：PPMd 对不可压缩的数据会略微膨胀，而编码器在输出
+/// 缓冲填满时会返回 0 进度。老版本遇到这种情况直接 break，等于静默把尾巴截断
+/// —— 那是一份悄悄损坏的归档，所以这里改成"没进度就扩容，翻倍 8 次还不行才报错"。
+pub fn encode_block_try(data: &[u8], order: u32, mem_mb: u32) -> Result<Vec<u8>, String> {
+    let params = params_for(order, mem_mb, data.len());
+    let mut enc = SevenZEncoder::new(params).map_err(|e| format!("encoder: {e:?}"))?;
+    drain_encoder(&mut enc, data)
+}
+
+/// 单块解压（panic 版，一次性调用用）。
 pub fn decode_block(packed: &[u8], blen: usize, order: u32, mem_mb: u32) -> Vec<u8> {
     decode_block_try(packed, blen, order, mem_mb).expect("decode")
 }
@@ -116,6 +130,10 @@ pub fn decode_block_try(
     let params = params_for(order, mem_mb, blen);
     let mut dec =
         SevenZDecoder::new(params, Some(blen as u64)).map_err(|e| format!("decoder: {e:?}"))?;
+    drain_decoder(&mut dec, packed, blen)
+}
+
+fn drain_decoder(dec: &mut SevenZDecoder, packed: &[u8], blen: usize) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; blen];
     let step = dec
         .decode(packed, true, &mut out)
@@ -129,17 +147,6 @@ pub fn decode_block_try(
     Ok(out)
 }
 
-/// 把长度/字节序写成小端。
-fn put_hdr(len: usize, order: u32, mem_mb: u32) -> [u8; HEADER_LEN] {
-    let mut h = [0u8; HEADER_LEN];
-    h[0..4].copy_from_slice(MAGIC);
-    h[4..8].copy_from_slice(&0u32.to_le_bytes());
-    h[8..16].copy_from_slice(&(len as u64).to_le_bytes());
-    h[16] = order as u8;
-    h[17..19].copy_from_slice(&(mem_mb as u16).to_le_bytes());
-    h
-}
-
 /// 读一块（按偏移），避免把整块文件读进内存后再切片。
 fn read_range(f: &mut fs::File, off: usize, n: usize) -> std::io::Result<Vec<u8>> {
     let mut data = vec![0u8; n];
@@ -151,6 +158,9 @@ fn read_range(f: &mut fs::File, off: usize, n: usize) -> std::io::Result<Vec<u8>
 }
 
 /// 压缩文件。返回 (原始字节数, 输出字节数)。
+///
+/// 线程里只建一次 encoder（模型存储跟着复用），块与块之间 `reset`；
+/// 压缩结果按"谁先完成谁先占位"的偏移直接写进输出文件，内存里只留索引。
 pub fn compress_file(
     inp: &str,
     outp: &str,
@@ -162,94 +172,162 @@ pub fn compress_file(
     let len = fs::metadata(inp).expect("stat").len() as usize;
     let ranges = block_ranges(len, bsz);
     let nb = ranges.len();
+    let data_start = HEADER_LEN + nb * INDEX_ENTRY;
+
+    let out_file = fs::File::create(outp).expect("create");
+    out_file.set_len(data_start as u64).expect("set_len");
+    let sink = Mutex::new(out_file);
+    let cursor = AtomicUsize::new(data_start);
+    let index: Mutex<Vec<(usize, u32, u32, u64)>> = Mutex::new(Vec::with_capacity(nb));
     let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(nb));
+
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1).min(nb) {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= nb {
-                    break;
+            sc.spawn(|| {
+                let mut enc: Option<SevenZEncoder> = None;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= nb {
+                        break;
+                    }
+                    let (a, b) = ranges[i];
+                    let mut f = fs::File::open(inp).expect("open");
+                    let data = read_range(&mut f, a, b - a).expect("read");
+                    drop(f);
+
+                    let params = params_for(order, mem_mb, data.len());
+                    let packed = match enc.as_mut() {
+                        Some(e) => {
+                            e.reset(params).expect("reset");
+                            drain_encoder(e, &data).expect("encode")
+                        }
+                        None => {
+                            let mut e = SevenZEncoder::new(params).expect("encoder");
+                            let packed = drain_encoder(&mut e, &data).expect("encode");
+                            enc = Some(e);
+                            packed
+                        }
+                    };
+
+                    let off = cursor.fetch_add(packed.len(), Ordering::Relaxed);
+                    {
+                        let mut w = sink.lock().unwrap();
+                        w.seek(SeekFrom::Start(off as u64)).expect("seek out");
+                        w.write_all(&packed).expect("write block");
+                    }
+                    index.lock().unwrap().push((
+                        i,
+                        (b - a) as u32,
+                        packed.len() as u32,
+                        off as u64,
+                    ));
                 }
-                let (a, b) = ranges[i];
-                let mut f = fs::File::open(inp).expect("open");
-                let data = read_range(&mut f, a, b - a).expect("read");
-                let out = encode_block(&data, order, mem_mb);
-                drop(f);
-                results.lock().unwrap().push((i, out));
             });
         }
     });
-    let mut v = results.into_inner().unwrap();
-    v.sort_by_key(|x| x.0);
 
-    let mut w = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(outp).expect("create"));
-    let mut hdr = put_hdr(len, order, mem_mb);
-    hdr[4..8].copy_from_slice(&(nb as u32).to_le_bytes());
-    w.write_all(&hdr).expect("w");
-    for (i, out) in &v {
-        let (a, b) = ranges[*i];
-        w.write_all(&((b - a) as u32).to_le_bytes()).expect("w");
-        w.write_all(&(out.len() as u32).to_le_bytes()).expect("w");
+    let mut idx = index.into_inner().unwrap();
+    idx.sort_by_key(|x| x.0);
+
+    let mut hdr = Vec::with_capacity(data_start);
+    hdr.extend_from_slice(MAGIC);
+    hdr.extend_from_slice(&(nb as u32).to_le_bytes());
+    hdr.extend_from_slice(&(len as u64).to_le_bytes());
+    hdr.push(order as u8);
+    hdr.extend_from_slice(&(mem_mb as u16).to_le_bytes());
+    let mut total = data_start;
+    for (_, blen, clen, off) in &idx {
+        hdr.extend_from_slice(&blen.to_le_bytes());
+        hdr.extend_from_slice(&clen.to_le_bytes());
+        hdr.extend_from_slice(&off.to_le_bytes());
+        total += *clen as usize;
     }
-    let mut total = HEADER_LEN + nb * INDEX_ENTRY;
-    for (_, out) in &v {
-        w.write_all(out).expect("w");
-        total += out.len();
+    {
+        let mut w = sink.into_inner().unwrap();
+        w.seek(SeekFrom::Start(0)).expect("seek head");
+        w.write_all(&hdr).expect("write head");
+        w.flush().expect("flush");
     }
-    w.flush().expect("flush");
     (len, total)
 }
 
-/// 解压文件。块目录先读，块数据按偏移随机读，不必把整个归档读进内存。
+/// 解压文件。认 ZAP2（索引带偏移）与旧版 ZAP1（流按块序隐式排列）。
 pub fn decompress_file(inp: &str, outp: &str, threads: usize) -> usize {
     let mut f = fs::File::open(inp).expect("open");
     let mut hdr = [0u8; HEADER_LEN];
     f.read_exact(&mut hdr).expect("read header");
-    assert_eq!(&hdr[0..4], MAGIC, "不是 ZAP1 格式");
+    let magic = &hdr[0..4];
+    let v1 = magic == MAGIC_V1;
+    if !v1 && magic != MAGIC {
+        panic!("不是 ZAP1 / ZAP2 格式：{:?}", magic);
+    }
     let nb = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
     let len = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
     let order = hdr[16] as u32;
     let mem_mb = u16::from_le_bytes(hdr[17..19].try_into().unwrap()) as u32;
 
+    let entry = if v1 { INDEX_ENTRY_V1 } else { INDEX_ENTRY };
     let mut blocks = Vec::with_capacity(nb);
-    let mut off = HEADER_LEN + nb * INDEX_ENTRY;
+    let mut off = HEADER_LEN + nb * entry;
+    let mut out_off = 0usize;
     for _ in 0..nb {
-        let mut e = [0u8; INDEX_ENTRY];
-        f.read_exact(&mut e).expect("read index");
+        let mut e = [0u8; 16];
+        f.read_exact(&mut e[..entry]).expect("read index");
         let blen = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
         let clen = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
-        blocks.push((blen, clen, off));
-        off += clen;
+        let at = if v1 {
+            let here = off;
+            off += clen;
+            here
+        } else {
+            u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize
+        };
+        blocks.push((blen, clen, at, out_off));
+        out_off += blen;
     }
     drop(f);
 
-    let results: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::with_capacity(nb));
+    // 解压结果按块偏移直接落盘：内存里不再攒整份输出（1GB 文件曾吃掉 1.1GB 峰值 RSS）。
+    let out_file = fs::File::create(outp).expect("create");
+    out_file.set_len(len as u64).expect("set_len");
+    let sink = Mutex::new(out_file);
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1).min(nb.max(1)) {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= nb {
-                    break;
+            sc.spawn(|| {
+                let mut dec: Option<SevenZDecoder> = None;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= nb {
+                        break;
+                    }
+                    let (blen, clen, o, at) = blocks[i];
+                    let mut f = fs::File::open(inp).expect("open");
+                    let packed = read_range(&mut f, o, clen).expect("read block");
+                    drop(f);
+
+                    let params = params_for(order, mem_mb, blen);
+                    let out = match dec.as_mut() {
+                        Some(d) => {
+                            d.reset(params, Some(blen as u64)).expect("reset");
+                            drain_decoder(d, &packed, blen).expect("decode")
+                        }
+                        None => {
+                            let mut d =
+                                SevenZDecoder::new(params, Some(blen as u64)).expect("decoder");
+                            let out = drain_decoder(&mut d, &packed, blen).expect("decode");
+                            dec = Some(d);
+                            out
+                        }
+                    };
+                    let mut w = sink.lock().unwrap();
+                    w.seek(SeekFrom::Start(at as u64)).expect("seek out");
+                    w.write_all(&out).expect("write block");
                 }
-                let (blen, clen, o) = blocks[i];
-                let mut f = fs::File::open(inp).expect("open");
-                let packed = read_range(&mut f, o, clen).expect("read block");
-                drop(f);
-                let out = decode_block(&packed, blen, order, mem_mb);
-                results.lock().unwrap().push((i, out));
             });
         }
     });
-    let mut v = results.into_inner().unwrap();
-    v.sort_by_key(|x| x.0);
-
-    let mut w = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(outp).expect("create"));
-    for (_, out) in &v {
-        w.write_all(out).expect("write");
-    }
-    w.flush().expect("flush");
+    sink.into_inner().unwrap().flush().expect("flush");
     len
 }
 
@@ -286,7 +364,7 @@ pub fn auto_bsz(len: usize, threads: usize) -> usize {
 /// 失败返回非 0（参数非法 / 内存不足 / 编码错误）。调用方负责用 `zap_free` 释放。
 ///
 /// 注意：这是**单块**接口，输出流不自带块头。大文件请按 4–32MB 分块各自调用，
-/// 长度和解压时的 `unpacked_len` 由你自己记账（CLI 的 ZAP1 格式就是这么拼的）。
+/// 长度和解压时的 `unpacked_len` 由你自己记账（CLI 的 ZAP2 格式就是这么拼的）。
 ///
 /// # Safety
 /// `data` 必须指向至少 `len` 字节的可读内存；`out_ptr` / `out_len` 必须是可写指针。

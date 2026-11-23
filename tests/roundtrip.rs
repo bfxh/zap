@@ -105,7 +105,7 @@ fn file_roundtrip_multi_block() {
 
     // 头部字段校验：magic / 块数 / 总长 / order / mem
     let head = std::fs::read(&arc).unwrap();
-    assert_eq!(&head[0..4], b"ZAP1");
+    assert_eq!(&head[0..4], b"ZAP2");
     assert_eq!(
         u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize,
         5
@@ -130,5 +130,45 @@ fn file_roundtrip_multi_block() {
         data.len()
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 旧版 ZAP1（流按块序隐式排列、目录项 8 字节）仍要能解：用户手里可能有 v0.1 的归档。
+#[test]
+fn decodes_v1_archive() {
+    let dir = std::env::temp_dir().join(format!("zap-v1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let inp = dir.join("in.bin");
+    let arc = dir.join("v1.zap");
+    let back = dir.join("back.bin");
+
+    let a = text_like(64 * 1024);
+    let b = text_like(48 * 1024);
+    std::fs::File::create(&inp)
+        .unwrap()
+        .write_all(&[a.clone(), b.clone()].concat())
+        .unwrap();
+
+    let (pa, pb) = (zap::encode_block(&a, 6, 16), zap::encode_block(&b, 6, 16));
+    let mut w = Vec::new();
+    w.extend_from_slice(b"ZAP1");
+    w.extend_from_slice(&2u32.to_le_bytes());
+    w.extend_from_slice(&((a.len() + b.len()) as u64).to_le_bytes());
+    w.push(6);
+    w.extend_from_slice(&16u16.to_le_bytes());
+    for (blen, clen) in [(a.len(), pa.len()), (b.len(), pb.len())] {
+        w.extend_from_slice(&(blen as u32).to_le_bytes());
+        w.extend_from_slice(&(clen as u32).to_le_bytes());
+    }
+    w.extend_from_slice(&pa);
+    w.extend_from_slice(&pb);
+    std::fs::write(&arc, &w).unwrap();
+
+    let got = zap::decompress_file(arc.to_str().unwrap(), back.to_str().unwrap(), 2);
+    assert_eq!(got, a.len() + b.len());
+    assert!(zap::files_equal(
+        inp.to_str().unwrap(),
+        back.to_str().unwrap()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
