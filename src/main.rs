@@ -6,7 +6,7 @@ use zap::*;
 
 /// 三档预设：(名字, 阶数, 每线程内存 MB, 块大小 MB)
 const LEVELS: [(&str, u32, u32, usize); 3] =
-    [("fast", 5, 16, 8), ("std", 6, 96, 32), ("max", 8, 512, 128)];
+    [("fast", 5, 24, 8), ("std", 6, 96, 32), ("max", 8, 512, 128)];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
