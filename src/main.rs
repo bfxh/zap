@@ -4,11 +4,27 @@ use std::fs;
 use std::time::Instant;
 use zap::*;
 
+/// 三档预设：(名字, 阶数, 每线程内存 MB, 块大小 MB)
+const LEVELS: [(&str, u32, u32, usize); 3] = [
+    ("fast", 5, 64, 8),
+    ("std", 6, 128, 32),
+    ("max", 8, 512, 128),
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
-    let order: u32 = envu("ZAP_ORDER", 6);
-    let mem_mb: u32 = envu("ZAP_MEM", 64);
+
+    let level = std::env::var("ZAP_LEVEL").unwrap_or_else(|_| "std".to_string());
+    let lv = LEVELS
+        .iter()
+        .find(|l| l.0 == level.as_str())
+        .copied()
+        .unwrap_or(LEVELS[1]);
+    let order: u32 = envu("ZAP_ORDER", lv.1);
+    let mem_mb: u32 = envu("ZAP_MEM", lv.2);
+    let bsz_mb: usize = envu("ZAP_BSZ", lv.3);
+
     let par_idx = if cmd == "t" { 3 } else { 4 };
     let par: usize = args
         .get(par_idx)
@@ -21,20 +37,19 @@ fn main() {
     match cmd {
         "c" => {
             let len = fs::metadata(&args[2]).expect("stat").len() as usize;
-            let bsz = envu::<usize>("ZAP_BSZ", 0);
-            let bsz = if bsz == 0 {
+            let bsz = if bsz_mb == 0 {
                 auto_bsz(len, par)
             } else {
-                bsz << 20
+                bsz_mb << 20
             };
             let t0 = Instant::now();
             let (n, out_len) = compress_file(&args[2], &args[3], par, order, mem_mb, bsz);
             let secs = t0.elapsed().as_secs_f64();
             println!(
-                "zap c {} -> {} in={} out={} bpb={:.4} order={} mem={}MB threads={} block={}MB speed={:.2}MB/s {:.1}s",
+                "zap c {} -> {} in={} out={} bpb={:.4} level={} order={} mem={}MB threads={} block={}MB speed={:.2}MB/s {:.1}s",
                 args[2], args[3], n, out_len,
                 out_len as f64 * 8.0 / n.max(1) as f64,
-                order, mem_mb, par, bsz >> 20, n as f64 / 1e6 / secs, secs
+                lv.0, order, mem_mb, par, bsz >> 20, n as f64 / 1e6 / secs, secs
             );
         }
         "d" => {
@@ -51,11 +66,10 @@ fn main() {
         }
         "t" => {
             let len = fs::metadata(&args[2]).expect("stat").len() as usize;
-            let bsz = envu::<usize>("ZAP_BSZ", 0);
-            let bsz = if bsz == 0 {
+            let bsz = if bsz_mb == 0 {
                 auto_bsz(len, par)
             } else {
-                bsz << 20
+                bsz_mb << 20
             };
             let t1 = std::env::temp_dir().join("zap_a.bin");
             let t2 = std::env::temp_dir().join("zap_b.bin");
@@ -70,14 +84,20 @@ fn main() {
             let _ = fs::remove_file(&t1);
             let _ = fs::remove_file(&t2);
             println!(
-                "zap t {} in={} out={} bpb={:.4} lossless={} threads={} block={}MB enc={:.1}s({:.2}MB/s) dec={:.1}s({:.2}MB/s)",
-                args[2], n, out_len, out_len as f64 * 8.0 / n.max(1) as f64, ok, par, bsz >> 20,
+                "zap t {} in={} out={} bpb={:.4} lossless={} level={} threads={} block={}MB enc={:.1}s({:.2}MB/s) dec={:.1}s({:.2}MB/s)",
+                args[2], n, out_len, out_len as f64 * 8.0 / n.max(1) as f64, ok,
+                lv.0, par, bsz >> 20,
                 enc, n as f64 / 1e6 / enc, dec, n as f64 / 1e6 / dec
             );
         }
         _ => {
             println!("zap: c <in> <out> [threads] | d <in> <out> [threads] | t <in> [threads]");
-            println!("env: ZAP_ORDER(6) ZAP_MEM(64MB) ZAP_BSZ(auto MB)");
+            println!(
+                "env: ZAP_LEVEL(fast|std|max) ZAP_ORDER ZAP_MEM(每线程 MB) ZAP_BSZ(MB, 0=自动)"
+            );
+            for (name, o, m, b) in LEVELS {
+                println!("  ZAP_LEVEL={name}: order={o} mem={m}MB block={b}MB");
+            }
         }
     }
 }
