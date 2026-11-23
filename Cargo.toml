@@ -3,6 +3,8 @@ name = "zap"
 version = "0.1.0"
 edition = "2021"
 description = "Portable multithreaded PPMd archiver"
+default-run = "zap"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "zap"
