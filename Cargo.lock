@@ -10,7 +10,7 @@ checksum = "87b394d314ab49627003873ff55e00b05f0667a738ddfa176f59717994553937"
 
 [[package]]
 name = "zap"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "ppmd-turbo",
 ]
